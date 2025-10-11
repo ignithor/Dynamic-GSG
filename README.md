@@ -43,7 +43,7 @@
   
   ✅  Realese multi-layer scene graph construction LVLM prompts.
   
-  ✅  Open source deployment code using realsense d455.
+  ✅  Open source <a href="https://github.com/GeLuzhou/Dynamic-GSG/tree/main/data_collect/README.md">deployment code</a> using realsense d455.
   
   ✅  Update detailed tutorial and code of DynamicGSG.
 
