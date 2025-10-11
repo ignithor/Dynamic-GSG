@@ -59,7 +59,7 @@ conda install cuda-toolkit==12.1.1 -c conda-forge
 conda install opencv -c conda-forge
 pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121
 
-git clone https://github.com/GeLuzhou/Dynamic-GSG.git
+git clone --recursive https://github.com/GeLuzhou/Dynamic-GSG.git
 cd Dynamic-GSG
 
 export CUDA_HOME=/your/env/path/of/dgsg
@@ -67,13 +67,11 @@ export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib:$LD_LIBRARY_PATH
 
 # Install gaussian rasterization
-git clone https://github.com/JonathonLuiten/diff-gaussian-rasterization-w-depth.git
-cd diff-gaussian-rasterization-w-depth
+cd submodules/diff-gaussian-rasterization-w-depth
 pip install .
 
 # Install GroundingDINO
-git clone https://github.com/IDEA-Research/GroundingDINO.git
-cd GroundingDINO
+cd ../GroundingDINO
 pip install .
 
 cd ..

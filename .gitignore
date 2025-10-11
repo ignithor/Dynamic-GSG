@@ -1,7 +1,6 @@
 models/*
 data/*
 experiments/*
-diff-gaussian-rasterization-w-depth/*
 third_party/*
 misc/*
 hardcode/*
