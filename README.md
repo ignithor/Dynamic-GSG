@@ -172,13 +172,10 @@ This work is built on many amazing research works and open-source projects, than
 ### Citation
 If you find our paper and code useful, please cite us:
 ```bibtex
-@misc{ge2025dynamicgsgdynamic3dgaussian,
-      title={DynamicGSG: Dynamic 3D Gaussian Scene Graphs for Environment Adaptation}, 
-      author={Luzhou Ge and Xiangyu Zhu and Zhuo Yang and Xuesong Li},
-      year={2025},
-      eprint={2502.15309},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2502.15309}, 
+@article{ge2025dynamicgsg,
+  title={DynamicGSG: Dynamic 3D Gaussian Scene Graphs for Environment Adaptation},
+  author={Ge, Luzhou and Zhu, Xiangyu and Yang, Zhuo and Li, Xuesong},
+  journal={arXiv preprint arXiv:2502.15309},
+  year={2025}
 }
 ```
