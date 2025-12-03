@@ -605,7 +605,7 @@ def dgsg(config: dict):
 
         
         ai_client = OpenAI(
-            api_key="YOUR QWEN API KEY",
+            api_key=os.getenv("OPENAI_API_KEY"),
         )
 
     # Init
