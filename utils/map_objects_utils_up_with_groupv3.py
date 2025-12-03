@@ -1441,7 +1441,7 @@ def save_objects(params, objects: MapObjectList, dataset, ai_client, lf_config, 
             {"role": "user", "content": [{"type": "text", "text": obj_category_parse_prompt}]},
         ]
         chat_response = ai_client.chat.completions.create(
-            model="qwen2.5-vl-72b-instruct", messages=messages
+            model="gpt-4o", messages=messages
         )
         answer = chat_response.choices[0].message.content
         answer = answer.replace("'", '"')
@@ -1454,7 +1454,7 @@ def save_objects(params, objects: MapObjectList, dataset, ai_client, lf_config, 
             {"role": "user", "content": [{"type": "text", "text": obj_caption_parse_prompt}]},
         ]
         chat_response = ai_client.chat.completions.create(
-            model="qwen2.5-vl-72b-instruct", messages=messages
+            model="gpt-4o", messages=messages
         )
         answer = chat_response.choices[0].message.content
         answer = answer.replace("'", '"')
