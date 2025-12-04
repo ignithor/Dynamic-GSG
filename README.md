@@ -57,6 +57,7 @@ conda create -n dgsg python=3.10
 conda activate dgsg
 conda install cuda-toolkit==12.1.1 -c conda-forge
 conda install opencv -c conda-forge
+conda install -c conda-forge ninja
 pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121
 
 git clone https://github.com/GeLuzhou/Dynamic-GSG.git
@@ -69,14 +70,18 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib:$LD_LIBRARY_PATH
 
 # Install gaussian rasterization
 cd submodules/diff-gaussian-rasterization-w-depth
-pip install .
+pip install . --no-build-isolation
 
 # Install GroundingDINO
 cd ../GroundingDINO
-pip install .
+pip install . --no-build-isolation
 
 cd ..
 pip install -r requirements.txt
+
+mkdir models
+cd models
+wget https://huggingface.co/laion/CLIP-ViT-H-14-laion2B-s32B-b79K/resolve/main/open_clip_pytorch_model.bin -O ./models/open_clip_pytorch_model.bin
 
 ```
 
