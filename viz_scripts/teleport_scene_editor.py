@@ -3,6 +3,7 @@ import os
 import sys
 import pickle
 import gzip
+import copy
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -55,7 +56,8 @@ def preprocess_object_geometry(scene_data, objects, objects_idx):
         if not np.any(mask) or np.sum(mask) < 10:
             # Set defaults to avoid KeyErrors later
             obj['center'] = np.array([0, 0, 0])
-            obj['bbox'] = o3d.geometry.OrientedBoundingBox(np.array([0,0,0]), np.eye(3), np.array([0.1, 0.1, 0.1]))
+            # Default tiny box
+            obj['bbox'] = o3d.geometry.OrientedBoundingBox(np.array([0,0,0]), np.eye(3), np.array([0.01, 0.01, 0.01]))
             continue
             
         obj_points = all_means3D[mask]
@@ -65,10 +67,7 @@ def preprocess_object_geometry(scene_data, objects, objects_idx):
         pcd.points = o3d.utility.Vector3dVector(obj_points)
         
         # Optional: Remove outliers to get a tighter bbox
-        # nb_neighbors=20, std_ratio=2.0 is a standard conservative setting
         cl, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-        
-        # If outlier removal deletes everything, revert to original
         if len(cl.points) > 0:
             pcd = cl
             
@@ -83,7 +82,7 @@ def preprocess_object_geometry(scene_data, objects, objects_idx):
             print(f"Warning: Failed to compute bbox for object {idx}: {e}")
             center = np.mean(obj_points, axis=0)
             obj['center'] = center
-            obj['bbox'] = o3d.geometry.OrientedBoundingBox(center, np.eye(3), np.array([0.1,0.1,0.1]))
+            obj['bbox'] = o3d.geometry.OrientedBoundingBox(center, np.eye(3), np.array([0.01,0.01,0.01]))
 
     print(f"[System] Computed geometry for {count} objects.")
 
@@ -113,148 +112,427 @@ def get_object_by_text(objects, text_query, clip_model, clip_tokenizer):
         
     return objects[best_idx], score
 
-def clone_background_fill(scene_data, objects_idx, hole_center, hole_radius, fill_count=5000):
+def highlight_object_command(scene_data, original_colors, objects, objects_idx, clip_model, clip_tokenizer):
+    print("\n" + "="*40)
+    print("      OBJECT HIGHLIGHTING      ")
+    print("="*40)
+    command = input(">> Enter object description to highlight (e.g., 'the red chair'): ")
+    
+    # Reset colors to original before applying new highlight
+    scene_data['colors_precomp'] = original_colors.clone()
+
+    # 1. Find Object
+    target_obj, score = get_object_by_text(objects, command, clip_model, clip_tokenizer)
+    
+    if target_obj is None:
+        print(f"[System] No object found matching '{command}'.")
+        return scene_data, False
+
+    print(f"[System] Found: ID {target_obj['idx']} ({target_obj['caption']}) | Score: {score:.3f}")
+    
+    # 2. Find indices of the object
+    # Ensure objects_idx is 1D
+    if objects_idx.ndim > 1:
+        objects_idx = objects_idx.flatten()
+        
+    target_indices = np.where(objects_idx == target_obj['idx'])[0]
+    
+    if len(target_indices) == 0:
+        print("[System] Object has no points in the scene.")
+        return scene_data, False
+        
+    # 3. Highlight in RED [1, 0, 0]
+    # We modify the colors_precomp tensor directly
+    red_color = torch.tensor([1.0, 0.0, 0.0], device="cuda", dtype=torch.float32)
+    scene_data['colors_precomp'][target_indices] = red_color
+    
+    print(f"[System] Highlighted {len(target_indices)} points in RED.")
+    return scene_data, True
+
+def check_collision(target_obj, new_center, all_objects, ref_obj_idx, verbose=True):
     """
-    Inpainting Logic: Finds 'background' (idx 0) Gaussians near the object 
-    and clones them into the hole location with random noise.
+    Checks if the target object at the new position intersects with any OTHER object.
+    Returns True if collision detected.
     """
-    # Ensure objects_idx is 1D for safety
+    # Create a ghost bounding box at the new location
+    ghost_bbox = copy.deepcopy(target_obj['bbox'])
+    ghost_bbox.center = new_center
+    
+    # Slightly scale down the ghost box (e.g., 95%) to allow objects to "touch"
+    # without triggering collision (like sitting ON a table).
+    ghost_bbox.scale(0.95, ghost_bbox.center)
+
+    for obj in all_objects:
+        # Don't check collision with itself
+        if obj['idx'] == target_obj['idx']:
+            continue
+        
+        # Don't check collision with the reference object (e.g. the table we are putting it on)
+        # We assume the user implies contact is okay.
+        if obj['idx'] == ref_obj_idx:
+            continue
+
+        # Skip invalid bboxes
+        if 'bbox' not in obj:
+            continue
+
+        # Check Intersection using Corner Approximation (Open3D doesn't have native OBB intersection)
+        # 1. Check if corners of ghost_bbox are inside obj['bbox']
+        ghost_corners = o3d.utility.Vector3dVector(np.asarray(ghost_bbox.get_box_points()))
+        inside_ghost = obj['bbox'].get_point_indices_within_bounding_box(ghost_corners)
+        
+        if len(inside_ghost) > 0:
+            if verbose:
+                print(f"[Collision Alert] Proposed move collides with Object ID {obj['idx']} ({obj['caption']})")
+            return True
+
+        # 2. Check if corners of obj['bbox'] are inside ghost_bbox
+        obj_corners = o3d.utility.Vector3dVector(np.asarray(obj['bbox'].get_box_points()))
+        inside_obj = ghost_bbox.get_point_indices_within_bounding_box(obj_corners)
+
+        if len(inside_obj) > 0:
+            if verbose:
+                print(f"[Collision Alert] Proposed move collides with Object ID {obj['idx']} ({obj['caption']})")
+            return True
+
+    return False
+
+def check_room_bounds(pos, scene_min, scene_max, margin=0.1):
+    """Checks if the position is within the room boundaries (scene min/max)."""
+    # Check XY (Floor plan). Z (Height) is less strict but good to check.
+    return (pos[0] > scene_min[0] + margin) and (pos[0] < scene_max[0] - margin) and \
+           (pos[1] > scene_min[1] + margin) and (pos[1] < scene_max[1] - margin)
+
+def find_valid_position(target_obj, start_pos, all_objects, ref_obj_idx, scene_min, scene_max, step_size=0.1, max_radius=2.0):
+    """
+    Searches for the nearest valid position around start_pos that doesn't collide AND stays in room.
+    """
+    # Helper to check both collision and bounds
+    def is_valid(pos):
+        in_bounds = check_room_bounds(pos, scene_min, scene_max)
+        if not in_bounds: return False
+        
+        collides = check_collision(target_obj, pos, all_objects, ref_obj_idx, verbose=False)
+        return not collides
+
+    # First check if the initial position is valid
+    if is_valid(start_pos):
+        return start_pos
+
+    print(f"[System] Collision or Out-of-Bounds detected. Searching for nearest valid space...")
+    
+    current_radius = step_size
+    while current_radius <= max_radius:
+        # Determine number of steps for this radius (approx circumference / step)
+        circumference = 2 * np.pi * current_radius
+        num_steps = int(circumference / step_size)
+        if num_steps < 4: num_steps = 4
+        
+        angles = np.linspace(0, 2*np.pi, num_steps, endpoint=False)
+        
+        for angle in angles:
+            offset_x = current_radius * np.cos(angle)
+            offset_y = current_radius * np.sin(angle)
+            
+            candidate_pos = np.copy(start_pos)
+            candidate_pos[0] += offset_x
+            candidate_pos[1] += offset_y
+            
+            if is_valid(candidate_pos):
+                print(f"[System] Valid position found at offset (dx={offset_x:.2f}, dy={offset_y:.2f})")
+                return candidate_pos
+        
+        current_radius += step_size
+
+    print(f"[System] Failed to find a valid position within {max_radius}m radius.")
+    return None
+
+def get_refined_object_mask(scene_data, target_obj, objects_idx):
+    """
+    Refines the object mask by combining the index mask with a spatial bounding box check.
+    This helps capture border points that might be mislabeled as background (0).
+    """
     if objects_idx.ndim > 1:
         objects_idx = objects_idx.flatten()
 
-    # 1. Find background points (idx == 0 is usually background/unassigned)
-    bg_indices = np.where(objects_idx == 0)[0]
-    if len(bg_indices) == 0: 
-        return scene_data, 0, None
+    target_mask = (objects_idx == target_obj['idx'])
     
-    bg_means = scene_data['means3D'][bg_indices]
-    hole_center_tensor = torch.tensor(hole_center, device='cuda', dtype=torch.float32)
+    # Use geometry to catch border points (often labeled as background 0)
+    all_points_np = scene_data['means3D'].detach().cpu().numpy()
     
-    # 2. Find background points physically close to the hole to sample texture from
-    dists = torch.norm(bg_means - hole_center_tensor, dim=1)
-    nearby_bg_mask = dists < (hole_radius * 2.5) # Look slightly outside the object
+    # Create temp Open3D cloud
+    pcd_all = o3d.geometry.PointCloud()
+    pcd_all.points = o3d.utility.Vector3dVector(all_points_np)
     
-    if nearby_bg_mask.sum() < 100:
-        # Fallback: Random sample if no close neighbors
-        source_indices = np.random.choice(bg_indices, size=fill_count, replace=True)
-    else:
-        # Sample from nearby valid background
-        valid_indices = bg_indices[nearby_bg_mask.cpu().numpy()]
-        source_indices = np.random.choice(valid_indices, size=fill_count, replace=True)
-
-    # 3. Clone Parameters
-    new_means = scene_data['means3D'][source_indices].clone()
-    new_colors = scene_data['colors_precomp'][source_indices].clone()
-    new_opacities = scene_data['opacities'][source_indices].clone()
-    new_scales = scene_data['scales'][source_indices].clone()
-    new_rots = scene_data['rotations'][source_indices].clone()
+    # Use the object's BBox, scaled up slightly to catch fuzzy borders
+    bbox = copy.deepcopy(target_obj['bbox'])
+    bbox.scale(1.1, bbox.center) # Expand by 10%
     
-    # 4. Scramble positions to fill the hole (Uniform distribution inside the radius)
-    noise = (torch.rand_like(new_means) * 2 - 1) * hole_radius
-    # Flatten Z noise to ensure we fill the floor, not the air (Assumes Z is Up)
-    noise[:, 2] *= 0.05 
+    # Find indices inside this box
+    indices_inside = bbox.get_point_indices_within_bounding_box(pcd_all.points)
     
-    new_means = hole_center_tensor + noise
-
-    # 5. Update Scene Data
-    scene_data['means3D'] = torch.cat([scene_data['means3D'], new_means], dim=0)
-    scene_data['colors_precomp'] = torch.cat([scene_data['colors_precomp'], new_colors], dim=0)
-    scene_data['opacities'] = torch.cat([scene_data['opacities'], new_opacities], dim=0)
-    scene_data['scales'] = torch.cat([scene_data['scales'], new_scales], dim=0)
-    scene_data['rotations'] = torch.cat([scene_data['rotations'], new_rots], dim=0)
+    spatial_mask = np.zeros(len(objects_idx), dtype=bool)
+    spatial_mask[indices_inside] = True
     
-    # Return count to update indices
-    return scene_data, len(source_indices)
+    # Only select points if they are the target object OR background (0)
+    valid_types = (objects_idx == target_obj['idx']) | (objects_idx == 0)
+    spatial_mask = spatial_mask & valid_types
+    
+    # Combine masks
+    final_mask = target_mask | spatial_mask
+    return final_mask
 
 def perform_teleportation(scene_data, objects, objects_idx, clip_model, clip_tokenizer):
     print("\n" + "="*40)
     print("      SEMANTIC OBJECT TELEPORTATION      ")
     print("="*40)
-    command = input(">> Enter command (e.g., 'put the chair near the table'): ")
+    command = input(">> Enter command (e.g., 'put the chair on the table' or 'near the door'): ")
     
-    # 1. Simple Parsing
+    relation = None
     if "near" in command:
+        relation = "near"
         parts = command.split("near")
     elif "next to" in command:
+        relation = "near"
         parts = command.split("next to")
+    elif "on" in command:
+        relation = "on"
+        parts = command.split("on")
     else:
-        print("Error: Command must contain 'near' or 'next to'.")
+        print("Error: Command not understood. Use 'near', 'next to', or 'on'.")
         return scene_data, objects_idx, False
 
     target_text = parts[0].replace("put", "").replace("the", "").replace("move", "").strip()
     ref_text = parts[1].replace("the", "").strip()
     
-    print(f"[System] Looking for Target: '{target_text}' | Reference: '{ref_text}'")
+    print(f"[System] Relation: {relation.upper()} | Target: '{target_text}' | Ref: '{ref_text}'")
 
-    # 2. Find Objects
+    # 1. Find Objects
     target_obj, _ = get_object_by_text(objects, target_text, clip_model, clip_tokenizer)
     ref_obj, _ = get_object_by_text(objects, ref_text, clip_model, clip_tokenizer)
 
     if target_obj is None or ref_obj is None:
-        print("[System] Failed to identify objects.")
+        print("[System] Failed to identify objects via CLIP.")
         return scene_data, objects_idx, False
 
     print(f"[System] Found Target: ID {target_obj['idx']} ({target_obj['caption']})")
     print(f"[System] Found Ref:    ID {ref_obj['idx']} ({ref_obj['caption']})")
 
-    # 3. Calculate Geometry
-    # Ensure centers are valid (handled by preprocess_object_geometry now)
+    # 2. Calculate Geometry
     t_center = np.array(target_obj['center'])
     r_center = np.array(ref_obj['center'])
     
-    # Estimate radius from bounding box
-    t_extent = target_obj['bbox'].get_max_bound() - target_obj['bbox'].get_min_bound()
-    r_extent = ref_obj['bbox'].get_max_bound() - ref_obj['bbox'].get_min_bound()
+    t_min_bound = target_obj['bbox'].get_min_bound()
+    t_max_bound = target_obj['bbox'].get_max_bound()
     
-    t_radius = max(t_extent[0], t_extent[1]) / 2.0
-    r_radius = max(r_extent[0], r_extent[1]) / 2.0
+    t_height = t_max_bound[2] - t_min_bound[2]
+    t_width_x = t_max_bound[0] - t_min_bound[0]
+    t_width_y = t_max_bound[1] - t_min_bound[1]
+    t_radius = max(t_width_x, t_width_y) / 2.0
     
-    # Direction Vector (Reference -> Target)
-    direction_vec = t_center - r_center
-    direction_vec[2] = 0 # Flatten to ground
-    
-    dist = np.linalg.norm(direction_vec)
-    if dist < 0.1: direction_vec = np.array([1.0, 0.0, 0.0]) # Default X if overlapping
-    else: direction_vec = direction_vec / dist
+    r_min_bound = ref_obj['bbox'].get_min_bound()
+    r_max_bound = ref_obj['bbox'].get_max_bound()
+    r_width_x = r_max_bound[0] - r_min_bound[0]
+    r_width_y = r_max_bound[1] - r_min_bound[1]
+    r_radius = max(r_width_x, r_width_y) / 2.0
+
+    new_pos = np.copy(r_center)
+
+    if relation == "near":
+        # --- NEAR LOGIC ---
+        direction_vec = t_center - r_center
+        direction_vec[2] = 0 
         
-    # Calculate New Position
-    buffer_dist = 0.15 
-    offset_dist = r_radius + t_radius + buffer_dist
-    new_pos = r_center + (direction_vec * offset_dist)
-    new_pos[2] = t_center[2] # Maintain original height
+        dist = np.linalg.norm(direction_vec)
+        if dist < 0.1: direction_vec = np.array([1.0, 0.0, 0.0]) # Default X axis
+        else: direction_vec = direction_vec / dist
+            
+        buffer_dist = 0.15 
+        offset_dist = r_radius + t_radius + buffer_dist
+        
+        new_pos = r_center + (direction_vec * offset_dist)
+        new_pos[2] = t_center[2] # Maintain original height
+
+    elif relation == "on":
+        # --- ON LOGIC ---
+        new_pos[0] = r_center[0]
+        new_pos[1] = r_center[1]
+        
+        ref_top_z = r_max_bound[2]
+        new_pos[2] = ref_top_z + (t_height / 2.0)
+        
+        print(f"[System] Stacking Z: Ref Top {ref_top_z:.2f} + Target Half-H {t_height/2.0:.2f} = {new_pos[2]:.2f}")
+
+    # 3. Collision & Bounds Resolution (Live Fix)
+    print("[System] Validating position and checking room bounds...")
     
+    # Calculate Scene Bounds (Min/Max of all points)
+    all_points_tensor = scene_data['means3D']
+    scene_min = torch.min(all_points_tensor, dim=0)[0].detach().cpu().numpy()
+    scene_max = torch.max(all_points_tensor, dim=0)[0].detach().cpu().numpy()
+    
+    final_pos = find_valid_position(target_obj, new_pos, objects, ref_obj['idx'], scene_min, scene_max)
+    
+    if final_pos is None:
+        print("[System] ABORTING: Could not find valid placement (collision or out of bounds).")
+        return scene_data, objects_idx, False
+    
+    new_pos = final_pos
+
+    # 4. Move the Target Gaussians using Refined Mask
     translation_vector = new_pos - t_center
     translation_tensor = torch.tensor(translation_vector, device='cuda', dtype=torch.float32)
 
-    # 4. Inpaint the Hole (Healing)
-    print("[System] Inpainting background hole...")
-    scene_data, filled_count = clone_background_fill(
-        scene_data, 
-        objects_idx, 
-        hole_center=t_center, 
-        hole_radius=t_radius
-    )
+    # Use the robust mask (same as deletion) to capture all parts of the object
+    print(f"[System] Selecting points using robust geometry mask...")
+    move_mask = get_refined_object_mask(scene_data, target_obj, objects_idx)
+    target_indices = np.where(move_mask)[0]
     
-    # Update indices array to account for new in-painted points (assign them to background 0)
-    if filled_count > 0:
-        new_indices = np.zeros(filled_count, dtype=objects_idx.dtype)
-        # Flatten objects_idx before concatenation to ensure compatibility
-        if objects_idx.ndim > 1:
-            objects_idx = objects_idx.flatten()
-        objects_idx = np.concatenate([objects_idx, new_indices])
-
-    # 5. Move the Target Gaussians
-    print(f"[System] Teleporting object {target_obj['idx']}...")
-    target_indices = np.where(objects_idx == target_obj['idx'])[0]
+    print(f"[System] Teleporting {len(target_indices)} points...")
     scene_data['means3D'][target_indices] += translation_tensor
 
-    # 6. Update Scene Graph Data
+    # 5. Update Indices & Scene Graph Data
+    # Reassign moved points (including border points that were 0) to the target object ID
+    if objects_idx.ndim > 1: objects_idx = objects_idx.flatten()
+    objects_idx[target_indices] = target_obj['idx']
+
     target_obj['center'] = new_pos
     target_obj['bbox'].translate(translation_vector)
-    target_obj['caption'] += f" (Moved)"
+    target_obj['caption'] += f" ({relation} {ref_obj['caption']})"
 
     print("[System] Done. Refreshing view.")
     return scene_data, objects_idx, True
+
+def perform_deletion(scene_data, objects, objects_idx, original_colors, clip_model, clip_tokenizer):
+    print("\n" + "="*40)
+    print("      OBJECT DELETION      ")
+    print("="*40)
+    command = input(">> Enter object description to delete (e.g., 'the lamp'): ")
+
+    # 1. Find Object
+    target_obj, score = get_object_by_text(objects, command, clip_model, clip_tokenizer)
+
+    if target_obj is None:
+        print(f"[System] No object found matching '{command}'.")
+        return scene_data, objects, objects_idx, original_colors, False
+
+    print(f"[System] Found: ID {target_obj['idx']} ({target_obj['caption']}) | Score: {score:.3f}")
+    
+    confirm = input(">> Are you sure you want to delete this object? (y/n): ")
+    if confirm.lower() != 'y':
+        print("[System] Deletion canceled.")
+        return scene_data, objects, objects_idx, original_colors, False
+
+    # 2. Use Refined Mask Logic
+    print("[System] Refining deletion mask using geometry...")
+    final_remove_mask = get_refined_object_mask(scene_data, target_obj, objects_idx)
+    keep_mask = ~final_remove_mask 
+    
+    points_to_remove = np.sum(final_remove_mask)
+    if points_to_remove == 0:
+        print("[System] Object has no points in the scene (ghost object). Removing from graph only.")
+    else:
+        print(f"[System] Deleting {points_to_remove} Gaussian points (Index + Spatial)...")
+
+    # 3. Filter Scene Data (Tensors)
+    keep_mask_tensor = torch.from_numpy(keep_mask).to("cuda")
+    
+    for key in scene_data:
+        if isinstance(scene_data[key], torch.Tensor):
+            scene_data[key] = scene_data[key][keep_mask_tensor]
+            
+    # Also update the backup colors so highlighting doesn't crash later
+    original_colors = original_colors[keep_mask_tensor]
+
+    # 4. Filter Index Array (Numpy)
+    if objects_idx.ndim > 1:
+        objects_idx = objects_idx.flatten()
+    objects_idx = objects_idx[keep_mask]
+
+    # 5. Remove from Scene Graph (List)
+    try:
+        objects.remove(target_obj)
+        print("[System] Object removed from Scene Graph.")
+    except ValueError:
+        print("[System] Warning: Object not found in list object list.")
+
+    return scene_data, objects, objects_idx, original_colors, True
+
+def rotate_camera_y(vis, direction):
+    """
+    Rotates the camera around the world Y axis (Yaw, assuming Y is Up).
+    direction: +1 for Left, -1 for Right
+    """
+    step = 5.0 * direction # Degrees
+    ctr = vis.get_view_control()
+    param = ctr.convert_to_pinhole_camera_parameters()
+    
+    # 1. Get W2C
+    w2c = np.array(param.extrinsic)
+    
+    # 2. Convert to C2W
+    c2w = np.linalg.inv(w2c)
+    
+    # 3. Create Rotation Matrix around Y
+    angle = np.radians(step)
+    cos_a = np.cos(angle)
+    sin_a = np.sin(angle)
+    
+    # Y-axis rotation matrix (4x4)
+    R_y = np.array([
+        [cos_a, 0, sin_a, 0],
+        [0,     1, 0,     0],
+        [-sin_a, 0, cos_a, 0],
+        [0,     0, 0,     1]
+    ])
+    
+    # 4. Apply rotation (Orbit around world origin)
+    new_c2w = R_y @ c2w
+    
+    # 5. Convert back to W2C
+    new_w2c = np.linalg.inv(new_c2w)
+    
+    param.extrinsic = new_w2c
+    ctr.convert_from_pinhole_camera_parameters(param)
+    vis.update_renderer()
+
+def rotate_camera_x(vis, direction):
+    """
+    Rotates the camera around the world X axis (Orbit/Pitch).
+    direction: +1 for Up, -1 for Down
+    """
+    step = 5.0 * direction # Degrees
+    ctr = vis.get_view_control()
+    param = ctr.convert_to_pinhole_camera_parameters()
+    
+    # 1. Get W2C
+    w2c = np.array(param.extrinsic)
+    
+    # 2. Convert to C2W
+    c2w = np.linalg.inv(w2c)
+    
+    # 3. Create Rotation Matrix around X
+    angle = np.radians(step)
+    cos_a = np.cos(angle)
+    sin_a = np.sin(angle)
+    
+    # X-axis rotation matrix (4x4)
+    R_x = np.array([
+        [1,     0,      0, 0],
+        [0, cos_a, -sin_a, 0],
+        [0, sin_a,  cos_a, 0],
+        [0,     0,      0, 1]
+    ])
+    
+    # 4. Apply rotation (Orbit around world origin)
+    new_c2w = R_x @ c2w
+    
+    # 5. Convert back to W2C
+    new_w2c = np.linalg.inv(new_c2w)
+    
+    param.extrinsic = new_w2c
+    ctr.convert_from_pinhole_camera_parameters(param)
+    vis.update_renderer()
 
 # ==================================================================================
 #                                   RENDERING & VIZ
@@ -264,11 +542,10 @@ def load_scene_data(scene_path, first_frame_w2c):
     all_params = dict(np.load(scene_path, allow_pickle=True))
     objects_idx = all_params['object_idx']
     
-    # Fix: Ensure objects_idx is 1D to prevent indexing errors later
+    # Ensure objects_idx is 1D
     if isinstance(objects_idx, np.ndarray) and objects_idx.ndim > 1:
         objects_idx = objects_idx.flatten()
     
-    # Extract only necessary tensors
     params = {}
     keys_to_load = ['means3D', 'rgb_colors', 'unnorm_rotations', 'logit_opacities', 'log_scales']
     
@@ -289,7 +566,6 @@ def load_scene_data(scene_path, first_frame_w2c):
         'means2D': torch.zeros_like(params['means3D'], device="cuda")
     }
     
-    # Load camera intrinsics/extrinsics
     w2c = all_params['w2c']
     intrinsics = all_params['intrinsics']
     
@@ -349,7 +625,6 @@ def rgbd2pcd(color, depth, w2c, intrinsics, viz_cfg):
 
 def main(scene_path, objects_path, viz_cfg):
     
-    # 1. Initialize CLIP
     print("Initializing CLIP model...")
     clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
         "ViT-H-14", viz_cfg.get('clip_model_path', None)
@@ -357,34 +632,30 @@ def main(scene_path, objects_path, viz_cfg):
     clip_model = clip_model.to('cuda')
     clip_tokenizer = open_clip.get_tokenizer("ViT-H-14")
     
-    # 2. Load Data
     print("Loading Scene Data...")
-    # Placeholder for first frame w2c, logic extracted from helper
     dummy_w2c = torch.eye(4).cuda() 
     scene_data, objects_idx, w2c, intrinsics = load_scene_data(scene_path, dummy_w2c)
     objects = load_objects(objects_path)
     
-    # Scale intrinsics for visualization
     k = intrinsics[:3, :3]
-    orig_w = 1200 # Assumptions if not in file
+    orig_w = 1200 
     orig_h = 680
     view_scale = viz_cfg.get('view_scale', 1.0)
     k[0, :] *= (viz_cfg['viz_w'] * view_scale) / orig_w
     k[1, :] *= (viz_cfg['viz_h'] * view_scale) / orig_h
 
-    # --- Preprocess Object Geometry (Fix for KeyError: 'center') ---
+    # Store original colors for highlighting reset
+    original_colors = scene_data['colors_precomp'].clone()
+
     preprocess_object_geometry(scene_data, objects, objects_idx)
 
-    # 3. Setup Open3D
     vis = o3d.visualization.VisualizerWithKeyCallback()
     
-    # Adjust width/height by view_scale if your config uses it
     vis.create_window(
         width=int(viz_cfg['viz_w'] * view_scale), 
         height=int(viz_cfg['viz_h'] * view_scale)
     )
     
-    # Initial Render
     im, depth = render(w2c, k, scene_data, viz_cfg)
     pts, cols = rgbd2pcd(im, depth, w2c, k, viz_cfg)
     pcd = o3d.geometry.PointCloud()
@@ -392,7 +663,6 @@ def main(scene_path, objects_path, viz_cfg):
     pcd.colors = cols
     vis.add_geometry(pcd)
     
-    # Setup Camera Control
     view_control = vis.get_view_control()
     cparams = o3d.camera.PinholeCameraParameters()
     cparams.extrinsic = w2c
@@ -401,26 +671,21 @@ def main(scene_path, objects_path, viz_cfg):
     cparams.intrinsic.width = int(viz_cfg['viz_w'] * view_scale)
     view_control.convert_from_pinhole_camera_parameters(cparams, allow_arbitrary=True)
 
-    # --- CALLBACK DEFINITION (REPRODUCING "OTHER CODE" METHOD) ---
-    # The callback now contains the input() AND the rendering loop.
+    # --- CALLBACKS ---
+
     def teleport_mode(vis):
         nonlocal scene_data, objects_idx
         
-        # 1. Ask input and update data (Blocks GUI temporarily)
         scene_data, objects_idx, updated = perform_teleportation(
             scene_data, objects, objects_idx, clip_model, clip_tokenizer
         )
         
-        # 2. Enter dedicated loop for this mode
         while True:
             cam_params = view_control.convert_to_pinhole_camera_parameters()
             curr_w2c = cam_params.extrinsic
-            curr_k = cam_params.intrinsic.intrinsic_matrix.copy()  # <--- copy() added
-            
-            # Since view control changes K, we need to ensure depth 1 at K[2,2]
+            curr_k = cam_params.intrinsic.intrinsic_matrix.copy()
             curr_k[2, 2] = 1
             
-            # Re-render
             im, depth = render(curr_w2c, curr_k, scene_data, viz_cfg)
             new_pts, new_cols = rgbd2pcd(im, depth, curr_w2c, curr_k, viz_cfg)
             
@@ -432,18 +697,81 @@ def main(scene_path, objects_path, viz_cfg):
                 break
             vis.update_renderer()
 
-    # Register 'M' for Move/Manipulate
+    def highlight_mode(vis):
+        nonlocal scene_data, objects_idx
+        
+        scene_data, updated = highlight_object_command(
+            scene_data, original_colors, objects, objects_idx, clip_model, clip_tokenizer
+        )
+        
+        if updated:
+            while True:
+                cam_params = view_control.convert_to_pinhole_camera_parameters()
+                curr_w2c = cam_params.extrinsic
+                curr_k = cam_params.intrinsic.intrinsic_matrix.copy()
+                curr_k[2, 2] = 1
+                
+                im, depth = render(curr_w2c, curr_k, scene_data, viz_cfg)
+                new_pts, new_cols = rgbd2pcd(im, depth, curr_w2c, curr_k, viz_cfg)
+                
+                pcd.points = new_pts
+                pcd.colors = new_cols
+                vis.update_geometry(pcd)
+                
+                if not vis.poll_events():
+                    break
+                vis.update_renderer()
+
+    def delete_mode(vis):
+        nonlocal scene_data, objects_idx, original_colors, objects
+        
+        scene_data, objects, objects_idx, original_colors, updated = perform_deletion(
+            scene_data, objects, objects_idx, original_colors, clip_model, clip_tokenizer
+        )
+        
+        if updated:
+            while True:
+                cam_params = view_control.convert_to_pinhole_camera_parameters()
+                curr_w2c = cam_params.extrinsic
+                curr_k = cam_params.intrinsic.intrinsic_matrix.copy()
+                curr_k[2, 2] = 1
+                
+                im, depth = render(curr_w2c, curr_k, scene_data, viz_cfg)
+                new_pts, new_cols = rgbd2pcd(im, depth, curr_w2c, curr_k, viz_cfg)
+                
+                pcd.points = new_pts
+                pcd.colors = new_cols
+                vis.update_geometry(pcd)
+                
+                if not vis.poll_events():
+                    break
+                vis.update_renderer()
+
+    # --- REGISTER KEYS ---
     vis.register_key_callback(ord("M"), teleport_mode)
+    vis.register_key_callback(ord("H"), highlight_mode)
+    vis.register_key_callback(ord("D"), delete_mode)
+    
+    # Camera Rotation
+    vis.register_key_callback(ord(","), lambda v: rotate_camera_y(v, 1))  # Left
+    vis.register_key_callback(ord("."), lambda v: rotate_camera_y(v, -1)) # Right
+    vis.register_key_callback(ord("["), lambda v: rotate_camera_x(v, 1))  # Up
+    vis.register_key_callback(ord("]"), lambda v: rotate_camera_x(v, -1)) # Down
 
     print("\nControls:")
-    print(" [M] : Trigger Object Teleportation (Input command in terminal)")
+    print(" [M] : Trigger Object Teleportation")
+    print(" [H] : Highlight Object")
+    print(" [D] : Delete Object")
+    print(" [,] : Rotate Camera Left (Y-Axis)")
+    print(" [.] : Rotate Camera Right (Y-Axis)")
+    print(" [[] : Rotate Camera Up (X-Axis)")
+    print(" []] : Rotate Camera Down (X-Axis)")
     print(" [Q] : Quit")
     
-    # --- MAIN RENDER LOOP ---
     while True:
         cam_params = view_control.convert_to_pinhole_camera_parameters()
         curr_w2c = cam_params.extrinsic
-        curr_k = cam_params.intrinsic.intrinsic_matrix.copy()  # <--- copy() added
+        curr_k = cam_params.intrinsic.intrinsic_matrix.copy()
         curr_k[2, 2] = 1
         
         im, depth = render(curr_w2c, curr_k, scene_data, viz_cfg)
@@ -463,18 +791,16 @@ if __name__ == "__main__":
     parser.add_argument("experiment", type=str, help="Path to experiment config file")
     args = parser.parse_args()
 
-    # Load Config
     experiment = SourceFileLoader(os.path.basename(args.experiment), args.experiment).load_module()
     config = experiment.config
     
-    # Resolve Paths
     if "scene_path" not in config:
         results_dir = os.path.join(config["workdir"], config["run_name"])
         scene_path = os.path.join(results_dir, "params_with_idx.npz")
         objects_path = os.path.join(results_dir, "objects.pkl.gz")
     else:
         scene_path = config["scene_path"]
-        objects_path = config["objects_path"] # Assuming this exists in config if scene_path does
+        objects_path = config["objects_path"]
 
     viz_cfg = config["viz"]
     
